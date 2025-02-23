@@ -3,12 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 )
 
 func getHealth(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(200)
+	w.WriteHeader(http.StatusOK)
 }
 
 func getHello(w http.ResponseWriter, r *http.Request) {
@@ -21,13 +22,28 @@ func getHello(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Hello %s\n", name)
 }
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
+func handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		_, _ = fmt.Fprintln(w, "Hello get")
+	} else if r.Method == http.MethodPost {
+		bodyData, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = fmt.Fprintf(w, "Hello post %s\n", bodyData)
+	} else {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
 
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", getHealth)
 	mux.HandleFunc("/hello", getHello)
+	mux.HandleFunc("/", handleRoot)
+
+	fmt.Println("Starting server")
 
 	err := http.ListenAndServe(":8080", mux)
 	if errors.Is(err, http.ErrServerClosed) {
