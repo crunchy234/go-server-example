@@ -1,0 +1,7 @@
+name: go-example-server
+description: A Go program to deploy a containerized service on AWS
+runtime: go
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: container-aws-go

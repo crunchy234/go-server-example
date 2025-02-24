@@ -1,124 +1,118 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
+	"github.com/pulumi/pulumi-aws/sdk/v6/go/aws/ecs"
+	"github.com/pulumi/pulumi-awsx/sdk/v2/go/awsx/ec2"
+	"github.com/pulumi/pulumi-awsx/sdk/v2/go/awsx/ecr"
+	ecrx "github.com/pulumi/pulumi-awsx/sdk/v2/go/awsx/ecr"
+	ecsx "github.com/pulumi/pulumi-awsx/sdk/v2/go/awsx/ecs"
+	lbx "github.com/pulumi/pulumi-awsx/sdk/v2/go/awsx/lb"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
+	"github.com/pulumi/pulumi/sdk/v3/go/pulumi/config"
 )
 
-var (
-	cfgFile string
-)
-
-// HTTP handlers (keeping your existing handlers)
-func getHealth(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
-}
-
-func getHello(w http.ResponseWriter, r *http.Request) {
-	var name string
-	if r.URL.Query().Has("name") {
-		name = r.URL.Query().Get("name")
-	} else {
-		name = "World"
-	}
-	_, _ = fmt.Fprintf(w, "Hello %s\n", name)
-}
-
-func handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		_, _ = fmt.Fprintln(w, "Hello get")
-	} else if r.Method == http.MethodPost {
-		bodyData, err := io.ReadAll(r.Body)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		_, _ = fmt.Fprintf(w, "Hello post %s\n", bodyData)
-	} else {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-	}
-}
-
-func runServer(_ *cobra.Command, _ []string) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", getHealth)
-	mux.HandleFunc("/hello", getHello)
-	mux.HandleFunc("/", handleRoot)
-
-	port := viper.GetString("port")
-	addr := fmt.Sprintf(":%s", port)
-	fmt.Printf("Starting server on port %s\n", port)
-
-	err := http.ListenAndServe(addr, mux)
-	if errors.Is(err, http.ErrServerClosed) {
-		fmt.Println("Server closed")
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("error starting server: %w", err)
-	}
-	return nil
-}
-
-func initConfig() {
-	if cfgFile != "" {
-		// Use config file from the flag
-		viper.SetConfigFile(cfgFile)
-	} else {
-		// Search config in current directory and home directory
-		home, err := os.UserHomeDir()
-		if err == nil {
-			viper.AddConfigPath(home)
-		}
-		viper.AddConfigPath(".")
-		viper.SetConfigType("yaml")
-		viper.SetConfigName("config")
-	}
-
-	// Read environment variables
-	viper.AutomaticEnv()
-	viper.SetEnvPrefix("SERVER") // Will be uppercased automatically
-
-	// Read in config file
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
+func getDefaultTags(ctx *pulumi.Context) pulumi.StringMap {
+	return pulumi.StringMap{
+		"Project": pulumi.String("ZZNZ Bio Profile"),
+		"Purpose": pulumi.String("Production"),
 	}
 }
 
 func main() {
-	rootCmd := &cobra.Command{
-		Use:   "server",
-		Short: "A simple HTTP server",
-		Long: `A simple HTTP server that handles various endpoints including:
-- /health for health checks
-- /hello for greeting (supports name parameter)
-- / for root endpoint (supports GET and POST)`,
-		RunE: runServer,
-	}
+	pulumi.Run(func(ctx *pulumi.Context) error {
+		defaultTags := getDefaultTags(ctx)
+		cfg := config.New(ctx, "")
+		containerPort := 80
+		if param := cfg.GetInt("containerPort"); param != 0 {
+			containerPort = param
+		}
+		cpu := 512
+		if param := cfg.GetInt("cpu"); param != 0 {
+			cpu = param
+		}
+		memory := 128
+		if param := cfg.GetInt("memory"); param != 0 {
+			memory = param
+		}
 
-	// Persistent flags (available to all commands)
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./config.yaml or $HOME/config.yaml)")
+		vpc, err := ec2.NewVpc(ctx, "go-server-vpc-"+ctx.Stack(), &ec2.VpcArgs{
+			Tags: defaultTags,
+			NatGateways: &ec2.NatGatewayConfigurationArgs{
+				Strategy: ec2.NatGatewayStrategyNone,
+			},
+			NumberOfAvailabilityZones: pulumi.IntRef(3),
+		})
 
-	// Local flags
-	rootCmd.Flags().StringP("port", "p", "8080", "Port number for the server")
+		// An ECS cluster to deploy into
+		cluster, err := ecs.NewCluster(ctx, "cluster", &ecs.ClusterArgs{
+			Tags: defaultTags,
+		})
+		if err != nil {
+			return err
+		}
 
-	// Bind Cobra flags with Viper
-	err := viper.BindPFlag("port", rootCmd.Flags().Lookup("port"))
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+		// An ALB to serve the container endpoint to the internet
+		loadbalancer, err := lbx.NewApplicationLoadBalancer(ctx, "loadbalancer", &lbx.ApplicationLoadBalancerArgs{
+			SubnetIds: vpc.PublicSubnetIds,
+			Tags:      defaultTags,
+		})
+		if err != nil {
+			return err
+		}
 
-	// Initialize Viper config
-	cobra.OnInitialize(initConfig)
+		// An ECR repository to store our application's container image
+		repo, err := ecrx.NewRepository(ctx, "repo", &ecrx.RepositoryArgs{
+			ForceDelete: pulumi.Bool(true),
+			Tags:        defaultTags,
+		})
+		if err != nil {
+			return err
+		}
 
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+		// Build and publish our application's container image from ./app to the ECR repository
+		image, err := ecrx.NewImage(ctx, "image", &ecr.ImageArgs{
+			RepositoryUrl: repo.Url,
+			Context:       pulumi.String("./app"),
+			Platform:      pulumi.String("linux/arm64"),
+			Args: pulumi.StringMap{
+				"build-arg": pulumi.String(fmt.Sprintf("PORT=%d", containerPort)),
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		// Deploy an ECS Service on Fargate to host the application container
+		_, err = ecsx.NewFargateService(ctx, "service", &ecsx.FargateServiceArgs{
+			Cluster:        cluster.Arn,
+			AssignPublicIp: pulumi.Bool(true),
+			TaskDefinitionArgs: &ecsx.FargateServiceTaskDefinitionArgs{
+				Container: &ecsx.TaskDefinitionContainerDefinitionArgs{
+					Name:      pulumi.String("app"),
+					Image:     image.ImageUri,
+					Cpu:       pulumi.Int(cpu),
+					Memory:    pulumi.Int(memory),
+					Essential: pulumi.Bool(true),
+					PortMappings: ecsx.TaskDefinitionPortMappingArray{
+						&ecsx.TaskDefinitionPortMappingArgs{
+							ContainerPort: pulumi.Int(containerPort),
+							HostPort:      pulumi.Int(containerPort),
+							Protocol:      pulumi.String("tcp"),
+							TargetGroup:   loadbalancer.DefaultTargetGroup,
+						},
+					},
+				},
+			},
+			DesiredCount: pulumi.Int(1),
+			Tags:         defaultTags,
+		})
+		if err != nil {
+			return err
+		}
+
+		// The URL at which the container's HTTP endpoint will be available
+		ctx.Export("url", pulumi.Sprintf("https://%s", loadbalancer.LoadBalancer.DnsName()))
+		return nil
+	})
 }
