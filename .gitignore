@@ -1,3 +1,4 @@
+infra/tmp
 ### Terraform template
 # Local .terraform directories
 **/.terraform/*
